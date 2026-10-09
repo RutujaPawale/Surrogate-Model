@@ -2,27 +2,20 @@
 Deep Learning (PyTorch CNN/Deconv) Surrogate Model for 2D Stress Field Prediction.
 
 Inputs: d_over_W, H_over_W (dimensionless geometry) standardized with training statistics.
-Target: 2D normalized stress field (sigma_vm / sigma) on fixed (128, 64) grid.
+Target: 2D normalized stress field (sigma_vm / sigma) on Cartesian (128, 64) or Polar (64, 64) grid.
 
 Architecture:
   - Input: (B, 2)
-  - FC layers: 2 -> 128 -> 256 -> (256 * 4 * 8) with ReLU
-  - Reshape to feature map: (B, 256, 4, 8)
+  - FC layers:
+      Cartesian: 2 -> 128 -> 256 -> (256 * 4 * 8) with ReLU
+      Polar:     2 -> 128 -> 256 -> (256 * 4 * 4) with ReLU
+  - Reshape:
+      Cartesian: (B, 256, 4, 8)
+      Polar:     (B, 256, 4, 4)
   - 4 Transposed-convolution stages with ReLU:
-      Stage 1: 256 -> 128, (4, 8) -> (8, 16)
-      Stage 2: 128 -> 64,  (8, 16) -> (16, 32)
-      Stage 3: 64  -> 32,  (16, 32) -> (32, 64)
-      Stage 4: 32  -> 1,   (32, 64) -> (64, 128)
-  - Bilinear resize to match target grid: (B, 1, 128, 64)
-
-Loss:
-  - Masked MSE on valid solid plate pixels only (hole pixels multiplied by 0).
-
-Training:
-  - Adam optimizer, initial lr=1e-3 with CosineAnnealingLR decay.
-  - Up to 1500 epochs, batch size 32.
-  - Early stopping on validation loss (patience 100), seed 42.
-  - Logs progress every 100 epochs.
+      Cartesian: (4, 8) -> (8, 16) -> (16, 32) -> (32, 64) -> (64, 128) -> resize to (128, 64)
+      Polar:     (4, 4) -> (8, 8)  -> (16, 16) -> (32, 32) -> (64, 64)
+  - Loss: Masked MSE on valid plate pixels only.
 
 Splits:
   (A) Interpolation: random 70/15/15 by geometry (seed 42).
@@ -30,9 +23,9 @@ Splits:
       Validation set: last 15% of the training geometries (highest d_over_W).
 
 Outputs:
-  - results/nn_predictions.npz
-  - results/nn_results.csv
-  - results/nn_best_worst.png
+  - results/nn_predictions[_polar].npz
+  - results/nn_results[_polar].csv
+  - results/nn_best_worst[_polar].png
 """
 import argparse
 import copy
@@ -58,33 +51,63 @@ class StressFieldNN(nn.Module):
     Fully-connected expansion followed by transposed convolution decoder
     to predict 2D stress fields from geometric parameters.
     """
-    def __init__(self):
+    def __init__(self, is_polar=False):
         super().__init__()
-        self.fc = nn.Sequential(
-            nn.Linear(2, 128),
-            nn.ReLU(),
-            nn.Linear(128, 256),
-            nn.ReLU(),
-            nn.Linear(256, 256 * 4 * 8),
-            nn.ReLU(),
-        )
-        self.deconv = nn.Sequential(
-            nn.ConvTranspose2d(256, 128, kernel_size=4, stride=2, padding=1),
-            nn.ReLU(),
-            nn.ConvTranspose2d(128, 64, kernel_size=4, stride=2, padding=1),
-            nn.ReLU(),
-            nn.ConvTranspose2d(64, 32, kernel_size=4, stride=2, padding=1),
-            nn.ReLU(),
-            nn.ConvTranspose2d(32, 1, kernel_size=4, stride=2, padding=1),
-        )
+        self.is_polar = is_polar
+        if is_polar:
+            # Polar grid decoder: naturally maps (4, 4) -> (64, 64)
+            self.fc = nn.Sequential(
+                nn.Linear(2, 128),
+                nn.ReLU(),
+                nn.Linear(128, 256),
+                nn.ReLU(),
+                nn.Linear(256, 256 * 4 * 4),
+                nn.ReLU(),
+            )
+            self.deconv = nn.Sequential(
+                nn.ConvTranspose2d(256, 128, kernel_size=4, stride=2, padding=1),
+                nn.ReLU(),
+                nn.ConvTranspose2d(128, 64, kernel_size=4, stride=2, padding=1),
+                nn.ReLU(),
+                nn.ConvTranspose2d(64, 32, kernel_size=4, stride=2, padding=1),
+                nn.ReLU(),
+                nn.ConvTranspose2d(32, 1, kernel_size=4, stride=2, padding=1),
+            )
+        else:
+            # Cartesian grid decoder: maps (4, 8) -> (64, 128) -> resized to (128, 64)
+            self.fc = nn.Sequential(
+                nn.Linear(2, 128),
+                nn.ReLU(),
+                nn.Linear(128, 256),
+                nn.ReLU(),
+                nn.Linear(256, 256 * 4 * 8),
+                nn.ReLU(),
+            )
+            self.deconv = nn.Sequential(
+                nn.ConvTranspose2d(256, 128, kernel_size=4, stride=2, padding=1),
+                nn.ReLU(),
+                nn.ConvTranspose2d(128, 64, kernel_size=4, stride=2, padding=1),
+                nn.ReLU(),
+                nn.ConvTranspose2d(64, 32, kernel_size=4, stride=2, padding=1),
+                nn.ReLU(),
+                nn.ConvTranspose2d(32, 1, kernel_size=4, stride=2, padding=1),
+            )
 
     def forward(self, x):
-        h = self.fc(x)
-        h = h.view(-1, 256, 4, 8)
-        out = self.deconv(h)  # Shape: (B, 1, 64, 128)
-        if out.shape[-2:] != (128, 64):
-            out = F.interpolate(out, size=(128, 64), mode="bilinear", align_corners=False)
-        return out
+        if self.is_polar:
+            h = self.fc(x)
+            h = h.view(-1, 256, 4, 4)
+            out = self.deconv(h)  # Shape: (B, 1, 64, 64)
+            if out.shape[-2:] != (64, 64):
+                out = F.interpolate(out, size=(64, 64), mode="bilinear", align_corners=False)
+            return out
+        else:
+            h = self.fc(x)
+            h = h.view(-1, 256, 4, 8)
+            out = self.deconv(h)  # Shape: (B, 1, 64, 128)
+            if out.shape[-2:] != (128, 64):
+                out = F.interpolate(out, size=(128, 64), mode="bilinear", align_corners=False)
+            return out
 
 
 # ---- Masked Loss -------------------------------------------------------------
@@ -152,40 +175,43 @@ def train_model(model, train_loader, X_val, y_val, m_val, max_epochs=1500,
             elapsed = time.perf_counter() - t_start
             print(f"Epoch {epoch:4d}/{max_epochs} | Train Loss: {train_loss:.6f} | "
                   f"Val Loss: {val_loss:.6f} (Best: {best_val_loss:.6f} @ Ep {best_epoch}) | "
-                  f"Time: {elapsed:.1f}s")
+                  f"Time: {elapsed:.1f}s", flush=True)
 
         if patience_counter >= patience:
-            print(f"Early stopping triggered at epoch {epoch} (no validation improvement for {patience} epochs).")
+            print(f"Early stopping triggered at epoch {epoch} (no validation improvement for {patience} epochs).", flush=True)
             break
 
     # Restore best weights
     if best_weights is not None:
         model.load_state_dict(best_weights)
-        print(f"Restored best model weights from epoch {best_epoch} (Val Loss: {best_val_loss:.6f}).")
+        print(f"Restored best model weights from epoch {best_epoch} (Val Loss: {best_val_loss:.6f}).", flush=True)
 
     return model, best_epoch
 
 
 # ---- Inference & Metric Calculations -----------------------------------------
-def predict_fields_nn(model, X_tensor, d_over_W, xi, eta):
+def predict_fields_nn(model, X_tensor, d_over_W, coord1, coord2, is_polar=False):
     """
-    Generates predicted fields from input tensor and applies the analytic hole mask.
+    Generates predicted fields from input tensor and applies the analytic hole mask (Cartesian only).
     """
     model.eval()
     with torch.no_grad():
-        preds = model(X_tensor)  # (M, 1, 128, 64)
+        preds = model(X_tensor)
     pred_fields = preds.squeeze(1).cpu().numpy().astype(np.float32)
 
-    M, ny, nx = pred_fields.shape
-    XI, ETA = np.meshgrid(xi, eta)
-    XI_sq_ETA_sq = XI ** 2 + ETA ** 2
+    M, n1, n2 = pred_fields.shape
 
-    masks = np.zeros((M, ny, nx), dtype=bool)
-    for i in range(M):
-        r_sq = (float(d_over_W[i]) / 2.0) ** 2
-        m = XI_sq_ETA_sq >= r_sq
-        masks[i] = m
-        pred_fields[i][~m] = 0.0
+    if is_polar:
+        masks = np.ones((M, n1, n2), dtype=bool)
+    else:
+        XI, ETA = np.meshgrid(coord1, coord2)
+        XI_sq_ETA_sq = XI ** 2 + ETA ** 2
+        masks = np.zeros((M, n1, n2), dtype=bool)
+        for i in range(M):
+            r_sq = (float(d_over_W[i]) / 2.0) ** 2
+            m = XI_sq_ETA_sq >= r_sq
+            masks[i] = m
+            pred_fields[i][~m] = 0.0
 
     return pred_fields, masks
 
@@ -228,7 +254,7 @@ def compute_field_metrics(pred_fields, true_fields, masks):
     }
 
 
-def time_inference_nn(model, X_tensor, d_over_W, xi, eta, n_repeats=100):
+def time_inference_nn(model, X_tensor, d_over_W, coord1, coord2, is_polar=False, n_repeats=100):
     """Measures single-sample and batched inference latency in microseconds."""
     model.eval()
     sample_x = X_tensor[:1]
@@ -240,20 +266,20 @@ def time_inference_nn(model, X_tensor, d_over_W, xi, eta, n_repeats=100):
         model(sample_x)
         t0 = time.perf_counter()
         for _ in range(n_repeats):
-            predict_fields_nn(model, sample_x, sample_d, xi, eta)
+            predict_fields_nn(model, sample_x, sample_d, coord1, coord2, is_polar=is_polar)
         single_us = 1e6 * (time.perf_counter() - t0) / n_repeats
 
         # Batched latency
         model(X_tensor)
         t1 = time.perf_counter()
-        predict_fields_nn(model, X_tensor, d_over_W, xi, eta)
+        predict_fields_nn(model, X_tensor, d_over_W, coord1, coord2, is_polar=is_polar)
         batched_us = 1e6 * (time.perf_counter() - t1) / len(X_tensor)
 
     return single_us, batched_us
 
 
 def plot_best_and_worst_samples(true_fields, pred_fields, masks, d_over_W, H_over_W,
-                                rel_l2_list, ids, xi, eta, out_path="results/nn_best_worst.png"):
+                                rel_l2_list, ids, coord1, coord2, is_polar=False, out_path="results/nn_best_worst.png"):
     """
     Visualizes true field, predicted field, and absolute error map
     for the best and worst test samples.
@@ -263,6 +289,9 @@ def plot_best_and_worst_samples(true_fields, pred_fields, masks, d_over_W, H_ove
 
     cases = [("Best Sample", best_idx), ("Worst Sample", worst_idx)]
     fig, axes = plt.subplots(2, 3, figsize=(13, 8), constrained_layout=True)
+
+    xlabel = r"$\theta$ [rad]" if is_polar else r"$\xi = x/W$"
+    ylabel_prefix = r"$s$" if is_polar else r"$\eta = y/W$"
 
     for row, (label, idx) in enumerate(cases):
         m = masks[idx]
@@ -275,34 +304,38 @@ def plot_best_and_worst_samples(true_fields, pred_fields, masks, d_over_W, H_ove
         l2_err = rel_l2_list[idx]
         sid = ids[idx]
 
-        axes[row, 0].set_ylabel(f"{label} (ID {sid})\n$\\eta = y/W$", fontsize=11, fontweight="bold")
+        axes[row, 0].set_ylabel(f"{label} (ID {sid})\n{ylabel_prefix}", fontsize=11, fontweight="bold")
+
+        extent = [coord2[0], coord2[-1], coord1[0], coord1[-1]] if is_polar else [coord1[0], coord1[-1], coord2[0], coord2[-1]]
+        aspect_mode = "auto" if is_polar else "equal"
 
         # True Field
         vmax_field = np.nanmax(yt) * 1.02
         vmin_field = 0.5
-        im0 = axes[row, 0].imshow(yt, origin="lower", extent=[xi[0], xi[-1], eta[0], eta[-1]],
-                                 cmap="inferno", vmin=vmin_field, vmax=vmax_field, aspect="equal")
+        im0 = axes[row, 0].imshow(yt, origin="lower", extent=extent,
+                                  cmap="inferno", vmin=vmin_field, vmax=vmax_field, aspect=aspect_mode)
         axes[row, 0].set_title(f"True Field ($d/W={d_val:.2f}, H/W={hw_val:.2f}$)\nPeak = {np.nanmax(yt):.2f}", fontsize=10)
-        axes[row, 0].set_xlabel(r"$\xi = x/W$")
+        axes[row, 0].set_xlabel(xlabel)
         fig.colorbar(im0, ax=axes[row, 0], fraction=0.04, pad=0.04)
 
         # Predicted Field
-        im1 = axes[row, 1].imshow(yp, origin="lower", extent=[xi[0], xi[-1], eta[0], eta[-1]],
-                                 cmap="inferno", vmin=vmin_field, vmax=vmax_field, aspect="equal")
+        im1 = axes[row, 1].imshow(yp, origin="lower", extent=extent,
+                                  cmap="inferno", vmin=vmin_field, vmax=vmax_field, aspect=aspect_mode)
         axes[row, 1].set_title(f"CNN-Deconv Predicted Field\nPeak = {np.nanmax(yp):.2f}", fontsize=10)
-        axes[row, 1].set_xlabel(r"$\xi = x/W$")
+        axes[row, 1].set_xlabel(xlabel)
         fig.colorbar(im1, ax=axes[row, 1], fraction=0.04, pad=0.04)
 
         # Absolute Error Map
         vmax_err = max(0.05, float(np.nanmax(diff) * 1.05))
-        im2 = axes[row, 2].imshow(diff, origin="lower", extent=[xi[0], xi[-1], eta[0], eta[-1]],
-                                 cmap="viridis", vmin=0.0, vmax=vmax_err, aspect="equal")
+        im2 = axes[row, 2].imshow(diff, origin="lower", extent=extent,
+                                  cmap="viridis", vmin=0.0, vmax=vmax_err, aspect=aspect_mode)
         axes[row, 2].set_title(f"Absolute Error Map\nRel $L_2$ Error = {l2_err:.3f}%", fontsize=10)
-        axes[row, 2].set_xlabel(r"$\xi = x/W$")
+        axes[row, 2].set_xlabel(xlabel)
         cbar2 = fig.colorbar(im2, ax=axes[row, 2], fraction=0.04, pad=0.04)
         cbar2.set_label("|Predicted - True|", fontsize=9)
 
-    fig.suptitle("PyTorch CNN-Deconv 2D Stress Field Reconstruction: Best vs. Worst Test Samples", fontsize=13, fontweight="bold")
+    title_desc = "Polar Grid (64x64)" if is_polar else "Cartesian Grid (128x64)"
+    fig.suptitle(f"PyTorch CNN-Deconv 2D Stress Field Reconstruction [{title_desc}]: Best vs. Worst Test Samples", fontsize=13, fontweight="bold")
     os.makedirs(os.path.dirname(out_path) or ".", exist_ok=True)
     fig.savefig(out_path, dpi=150)
     plt.close(fig)
@@ -321,28 +354,36 @@ def run_nn_pipeline(npz_path="data/fields.npz", max_epochs=1500, patience=100,
     torch.set_num_threads(6)
 
     if not os.path.exists(npz_path):
-        raise FileNotFoundError(f"{npz_path} not found. Run data_gen/gen_fields.py first.")
+        raise FileNotFoundError(f"{npz_path} not found.")
 
-    print(f"Loading {npz_path}...")
+    is_polar = "polar" in os.path.basename(npz_path).lower()
+    suffix = "_polar" if is_polar else ""
+
+    print(f"Loading {npz_path} (is_polar={is_polar})...")
     data = np.load(npz_path)
-    fields = data["fields"]       # (N, ny, nx)
-    masks = data["masks"]         # (N, ny, nx)
+    fields = data["fields"]       # (N, ny, nx) or (N, ns, ntheta)
+    masks = data["masks"] if "masks" in data else np.ones_like(fields, dtype=bool)
     d_over_W = data["d_over_W"]   # (N,)
     H_over_W = data["H_over_W"]   # (N,)
     kt_gross = data["kt_gross"]   # (N,)
     ids = data["ids"]             # (N,)
-    xi = data["xi"]               # (nx,)
-    eta = data["eta"]             # (ny,)
-    N = len(fields)
 
-    print(f"Loaded {N} fields of resolution {len(eta)}x{len(xi)}.")
+    if is_polar:
+        coord1 = data["s"] if "s" in data else np.linspace(0, 1, fields.shape[1])
+        coord2 = data["theta"] if "theta" in data else np.linspace(0, np.pi / 2, fields.shape[2])
+    else:
+        coord1 = data["xi"]
+        coord2 = data["eta"]
+
+    N = len(fields)
+    print(f"Loaded {N} fields of resolution {fields.shape[1]}x{fields.shape[2]}.")
 
     # Model architecture verification
-    dummy_model = StressFieldNN()
+    dummy_model = StressFieldNN(is_polar=is_polar)
     n_params = sum(p.numel() for p in dummy_model.parameters() if p.requires_grad)
     print(f"Model architecture initialized: {n_params:,} trainable parameters.")
 
-    # Target fields with channel dimension: (N, 1, 128, 64)
+    # Target fields with channel dimension: (N, 1, n1, n2)
     y_all = fields[:, None, :, :].astype(np.float32)
     m_all = masks[:, None, :, :].astype(np.float32)
     X_raw = np.column_stack([d_over_W, H_over_W]).astype(np.float32)
@@ -383,7 +424,7 @@ def run_nn_pipeline(npz_path="data/fields.npz", max_epochs=1500, patience=100,
         shuffle=True
     )
 
-    model_A = StressFieldNN()
+    model_A = StressFieldNN(is_polar=is_polar)
     model_A, best_ep_A = train_model(
         model=model_A,
         train_loader=train_loader_A,
@@ -397,16 +438,21 @@ def run_nn_pipeline(npz_path="data/fields.npz", max_epochs=1500, patience=100,
     )
 
     pred_fields_te_A, pred_masks_te_A = predict_fields_nn(
-        model_A, t_X_te_A, d_over_W[idx_te], xi, eta
+        model_A, t_X_te_A, d_over_W[idx_te], coord1, coord2, is_polar=is_polar
     )
     metrics_A = compute_field_metrics(pred_fields_te_A, fields[idx_te], masks[idx_te])
     single_us_A, batch_us_A = time_inference_nn(
-        model_A, t_X_te_A, d_over_W[idx_te], xi, eta
+        model_A, t_X_te_A, d_over_W[idx_te], coord1, coord2, is_polar=is_polar
     )
+
+    # Uniform field baseline error
+    u_err_A = [np.linalg.norm(1.0 - t[m]) / np.linalg.norm(t[m]) * 100 for t, m in zip(fields[idx_te], masks[idx_te])]
+    mean_u_err_A = float(np.mean(u_err_A))
 
     print("\n--- Interpolation Test Set Results ---")
     print(f"Mean Relative L2 Error: {metrics_A['mean_rel_l2_%']:.3f}%")
     print(f"Max Relative L2 Error:  {metrics_A['max_rel_l2_%']:.3f}%")
+    print(f"Uniform Field (1.0) Err: {mean_u_err_A:.3f}%")
     print(f"Mean Abs Pixel Error:   {metrics_A['mean_abs_pixel_err']:.4f}")
     print(f"Mean Peak Error:        {metrics_A['mean_peak_err_%']:.3f}%")
     print(f"Max Peak Error:         {metrics_A['max_peak_err_%']:.3f}%")
@@ -414,6 +460,7 @@ def run_nn_pipeline(npz_path="data/fields.npz", max_epochs=1500, patience=100,
     print(f"Batched latency:        {batch_us_A:,.1f} us/sample ({batch_us_A / 1000:.4f} ms/sample)")
 
     # Save diagnostic best/worst figure
+    out_fig_path = f"results/nn_best_worst{suffix}.png"
     plot_best_and_worst_samples(
         true_fields=fields[idx_te],
         pred_fields=pred_fields_te_A,
@@ -422,9 +469,10 @@ def run_nn_pipeline(npz_path="data/fields.npz", max_epochs=1500, patience=100,
         H_over_W=H_over_W[idx_te],
         rel_l2_list=metrics_A["per_sample_rel_l2_%"],
         ids=ids[idx_te],
-        xi=xi,
-        eta=eta,
-        out_path="results/nn_best_worst.png"
+        coord1=coord1,
+        coord2=coord2,
+        is_polar=is_polar,
+        out_path=out_fig_path
     )
 
     # =========================================================================
@@ -469,7 +517,7 @@ def run_nn_pipeline(npz_path="data/fields.npz", max_epochs=1500, patience=100,
         shuffle=True
     )
 
-    model_B = StressFieldNN()
+    model_B = StressFieldNN(is_polar=is_polar)
     model_B, best_ep_B = train_model(
         model=model_B,
         train_loader=train_loader_B,
@@ -483,16 +531,21 @@ def run_nn_pipeline(npz_path="data/fields.npz", max_epochs=1500, patience=100,
     )
 
     pred_fields_te_B, pred_masks_te_B = predict_fields_nn(
-        model_B, t_X_te_B, d_over_W[te_ext_idx], xi, eta
+        model_B, t_X_te_B, d_over_W[te_ext_idx], coord1, coord2, is_polar=is_polar
     )
     metrics_B = compute_field_metrics(pred_fields_te_B, fields[te_ext_idx], masks[te_ext_idx])
     single_us_B, batch_us_B = time_inference_nn(
-        model_B, t_X_te_B, d_over_W[te_ext_idx], xi, eta
+        model_B, t_X_te_B, d_over_W[te_ext_idx], coord1, coord2, is_polar=is_polar
     )
+
+    # Uniform field baseline error
+    u_err_B = [np.linalg.norm(1.0 - t[m]) / np.linalg.norm(t[m]) * 100 for t, m in zip(fields[te_ext_idx], masks[te_ext_idx])]
+    mean_u_err_B = float(np.mean(u_err_B))
 
     print("\n--- Extrapolation Test Set Results ---")
     print(f"Mean Relative L2 Error: {metrics_B['mean_rel_l2_%']:.3f}%")
     print(f"Max Relative L2 Error:  {metrics_B['max_rel_l2_%']:.3f}%")
+    print(f"Uniform Field (1.0) Err: {mean_u_err_B:.3f}%")
     print(f"Mean Abs Pixel Error:   {metrics_B['mean_abs_pixel_err']:.4f}")
     print(f"Mean Peak Error:        {metrics_B['mean_peak_err_%']:.3f}%")
     print(f"Max Peak Error:         {metrics_B['max_peak_err_%']:.3f}%")
@@ -503,7 +556,7 @@ def run_nn_pipeline(npz_path="data/fields.npz", max_epochs=1500, patience=100,
     # SAVE PREDICTIONS AND METRICS
     # =========================================================================
     # 1. Predictions .npz
-    out_preds_path = "results/nn_predictions.npz"
+    out_preds_path = f"results/nn_predictions{suffix}.npz"
     os.makedirs(os.path.dirname(out_preds_path) or ".", exist_ok=True)
     np.savez_compressed(
         out_preds_path,
@@ -521,19 +574,21 @@ def run_nn_pipeline(npz_path="data/fields.npz", max_epochs=1500, patience=100,
         extrap_d_over_W=d_over_W[te_ext_idx],
         extrap_H_over_W=H_over_W[te_ext_idx],
         extrap_kt_gross=kt_gross[te_ext_idx],
-        xi=xi,
-        eta=eta
+        coord1=coord1,
+        coord2=coord2,
+        is_polar=is_polar
     )
     print(f"\nSaved predictions archive to {out_preds_path} ({os.path.getsize(out_preds_path)/(1024*1024):.2f} MB).")
 
     # 2. Results CSV
-    out_csv_path = "results/nn_results.csv"
+    out_csv_path = f"results/nn_results{suffix}.csv"
     res_df = pd.DataFrame([
         {
             "split": "interp",
             "trainable_params": n_params,
             "mean_rel_l2_%": metrics_A["mean_rel_l2_%"],
             "max_rel_l2_%": metrics_A["max_rel_l2_%"],
+            "uniform_rel_l2_%": mean_u_err_A,
             "mean_abs_pixel_err": metrics_A["mean_abs_pixel_err"],
             "mean_peak_err_%": metrics_A["mean_peak_err_%"],
             "max_peak_err_%": metrics_A["max_peak_err_%"],
@@ -546,6 +601,7 @@ def run_nn_pipeline(npz_path="data/fields.npz", max_epochs=1500, patience=100,
             "trainable_params": n_params,
             "mean_rel_l2_%": metrics_B["mean_rel_l2_%"],
             "max_rel_l2_%": metrics_B["max_rel_l2_%"],
+            "uniform_rel_l2_%": mean_u_err_B,
             "mean_abs_pixel_err": metrics_B["mean_abs_pixel_err"],
             "mean_peak_err_%": metrics_B["mean_peak_err_%"],
             "max_peak_err_%": metrics_B["max_peak_err_%"],
@@ -562,7 +618,8 @@ def run_nn_pipeline(npz_path="data/fields.npz", max_epochs=1500, patience=100,
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="PyTorch CNN-Deconv 2D stress field surrogate.")
-    parser.add_argument("--npz", default="data/fields.npz", help="Path to fields.npz")
+    parser.add_argument("--data", default="data/fields.npz", help="Path to fields.npz or fields_polar.npz")
+    parser.add_argument("--npz", default=None, help="Alias for --data")
     parser.add_argument("--epochs", type=int, default=1500, help="Maximum epochs")
     parser.add_argument("--patience", type=int, default=100, help="Early stopping patience")
     parser.add_argument("--batch_size", type=int, default=32, help="Batch size")
@@ -570,8 +627,9 @@ if __name__ == "__main__":
     parser.add_argument("--seed", type=int, default=42, help="Random seed")
     args = parser.parse_args()
 
+    npz_file = args.npz if args.npz is not None else args.data
     run_nn_pipeline(
-        npz_path=args.npz,
+        npz_path=npz_file,
         max_epochs=args.epochs,
         patience=args.patience,
         batch_size=args.batch_size,

@@ -1,32 +1,33 @@
 """
 POD + Gaussian Process Surrogate Model for 2D Stress Field Prediction.
 
-Loads data/fields.npz.
+Loads data/fields.npz or data/fields_polar.npz.
 Inputs: d_over_W, H_over_W (dimensionless geometry).
-Target: 2D normalized stress field (sigma_vm / sigma) on fixed (128, 64) grid.
+Target: 2D normalized stress field (sigma_vm / sigma) on fixed Cartesian (128, 64) or Polar (64, 64) grid.
 
 Splits:
   (A) Interpolation: random 70/15/15 split by geometry (seed 42).
   (B) Extrapolation: train on d_over_W < 0.40, test on d_over_W >= 0.45.
 
 Method:
-  1. For PCA, fill circular hole pixels using nearest valid plate pixel value
-     (scipy.ndimage.distance_transform_edt with return_indices).
+  1. For Cartesian grid, fill hole pixels with nearest valid pixel value.
+     For Polar grid, all pixels are valid plate material (no hole inpainting needed).
   2. Flatten fields and fit PCA on the training set only.
   3. Evaluate validation reconstruction relative L2 error for 1..20 modes.
      Choose the smallest number of modes with mean error < 0.1% (or 20 if none).
   4. Train one Gaussian process per mode (StandardScaler on inputs, ARD RBF + WhiteKernel,
      normalize_y=True, seed 42) to predict the mode coefficient from (d_over_W, H_over_W).
-  5. Predict test fields, reconstruct 2D fields, and apply the analytic hole mask.
+  5. Predict test fields, reconstruct 2D fields, and apply the analytic hole mask (Cartesian only).
   6. Calculate metrics on valid pixels only:
      - Relative L2 error (mean, max)
      - Mean absolute pixel error
      - Peak stress error (%)
+     - Uniform field trivial baseline error
   7. Measure single-sample and batched prediction latency (microseconds).
   8. Save:
-     - results/pod_predictions.npz
-     - results/pod_results.csv
-     - results/pod_best_worst.png
+     - results/pod_predictions[_polar].npz
+     - results/pod_results[_polar].csv
+     - results/pod_best_worst[_polar].png
 """
 import argparse
 import os
@@ -52,19 +53,15 @@ def fill_hole_pixels(fields, masks):
     """
     Fills hole interior pixels using the nearest valid plate pixel value
     via Euclidean distance transform indices.
-    
-    Parameters:
-        fields (np.ndarray): (N, ny, nx) array of normalized stress fields
-        masks (np.ndarray): (N, ny, nx) boolean mask (True = valid plate, False = hole)
-        
-    Returns:
-        filled_fields (np.ndarray): (N, ny, nx) array with hole pixels filled
     """
     N = len(fields)
     filled = np.zeros_like(fields)
     for i in range(N):
-        _, ind = distance_transform_edt(~masks[i], return_indices=True)
-        filled[i] = fields[i][ind[0], ind[1]]
+        if np.all(masks[i]):
+            filled[i] = fields[i]
+        else:
+            _, ind = distance_transform_edt(~masks[i], return_indices=True)
+            filled[i] = fields[i][ind[0], ind[1]]
     return filled
 
 
@@ -138,34 +135,37 @@ def train_gp_surrogates(X_train, coeffs_train, n_modes, seed=42):
     return gps
 
 
-def predict_fields(gps, pca, X_test, d_over_W_test, xi, eta, n_modes):
+def predict_fields(gps, pca, X_test, d_over_W_test, coord1, coord2, n_modes, is_polar=False):
     """
     Predicts 2D normalized stress fields from geometric inputs:
       1. Predicts PCA coefficients via trained GPs.
       2. Reconstructs flattened 2D spatial fields.
-      3. Applies analytic circular hole mask (xi^2 + eta^2 >= (d_over_W/2)^2).
+      3. For Cartesian grid, applies analytic circular hole mask.
+         For Polar grid, all points are solid plate pixels (mask is all True).
     """
     M = len(X_test)
-    ny = len(eta)
-    nx = len(xi)
+    n1 = len(coord1)
+    n2 = len(coord2)
 
     # 1. Predict mode coefficients
     pred_coeffs = np.column_stack([gp.predict(X_test) for gp in gps[:n_modes]])
 
     # 2. Reconstruct full spatial fields
     pred_flat = pca.mean_ + pred_coeffs @ pca.components_[:n_modes]
-    pred_fields = pred_flat.reshape(M, ny, nx).astype(np.float32)
+    pred_fields = pred_flat.reshape(M, n1, n2).astype(np.float32)
 
-    # 3. Apply analytic hole mask
-    XI, ETA = np.meshgrid(xi, eta)
-    XI_sq_ETA_sq = XI ** 2 + ETA ** 2
-
-    masks = np.zeros((M, ny, nx), dtype=bool)
-    for i in range(M):
-        r_sq = (float(d_over_W_test[i]) / 2.0) ** 2
-        m = XI_sq_ETA_sq >= r_sq
-        masks[i] = m
-        pred_fields[i][~m] = 0.0
+    # 3. Apply mask
+    if is_polar:
+        masks = np.ones((M, n1, n2), dtype=bool)
+    else:
+        XI, ETA = np.meshgrid(coord1, coord2)
+        XI_sq_ETA_sq = XI ** 2 + ETA ** 2
+        masks = np.zeros((M, n1, n2), dtype=bool)
+        for i in range(M):
+            r_sq = (float(d_over_W_test[i]) / 2.0) ** 2
+            m = XI_sq_ETA_sq >= r_sq
+            masks[i] = m
+            pred_fields[i][~m] = 0.0
 
     return pred_fields, masks
 
@@ -211,7 +211,7 @@ def compute_field_metrics(pred_fields, true_fields, masks):
     }
 
 
-def time_inference(gps, pca, X_test, d_over_W_test, xi, eta, n_modes, n_repeats=100):
+def time_inference(gps, pca, X_test, d_over_W_test, coord1, coord2, n_modes, is_polar=False, n_repeats=100):
     """Measures single-sample and batched prediction latency in microseconds."""
     sample_x = X_test[:1]
     sample_d = d_over_W_test[:1]
@@ -219,19 +219,19 @@ def time_inference(gps, pca, X_test, d_over_W_test, xi, eta, n_modes, n_repeats=
     # Single-sample latency
     t0 = time.perf_counter()
     for _ in range(n_repeats):
-        predict_fields(gps, pca, sample_x, sample_d, xi, eta, n_modes)
+        predict_fields(gps, pca, sample_x, sample_d, coord1, coord2, n_modes, is_polar=is_polar)
     single_us = 1e6 * (time.perf_counter() - t0) / n_repeats
 
     # Batched latency
     t1 = time.perf_counter()
-    predict_fields(gps, pca, X_test, d_over_W_test, xi, eta, n_modes)
+    predict_fields(gps, pca, X_test, d_over_W_test, coord1, coord2, n_modes, is_polar=is_polar)
     batched_us = 1e6 * (time.perf_counter() - t1) / len(X_test)
 
     return single_us, batched_us
 
 
 def plot_best_and_worst_samples(true_fields, pred_fields, masks, d_over_W, H_over_W,
-                                rel_l2_list, ids, xi, eta, out_path="results/pod_best_worst.png"):
+                                rel_l2_list, ids, coord1, coord2, is_polar=False, out_path="results/pod_best_worst.png"):
     """
     Visualizes true field, predicted field, and absolute error map
     for the best and worst test samples.
@@ -241,6 +241,9 @@ def plot_best_and_worst_samples(true_fields, pred_fields, masks, d_over_W, H_ove
 
     cases = [("Best Sample", best_idx), ("Worst Sample", worst_idx)]
     fig, axes = plt.subplots(2, 3, figsize=(13, 8), constrained_layout=True)
+
+    xlabel = r"$\theta$ [rad]" if is_polar else r"$\xi = x/W$"
+    ylabel_prefix = r"$s$" if is_polar else r"$\eta = y/W$"
 
     for row, (label, idx) in enumerate(cases):
         m = masks[idx]
@@ -254,34 +257,38 @@ def plot_best_and_worst_samples(true_fields, pred_fields, masks, d_over_W, H_ove
         sid = ids[idx]
 
         # Row titles
-        axes[row, 0].set_ylabel(f"{label} (ID {sid})\n$\\eta = y/W$", fontsize=11, fontweight="bold")
+        axes[row, 0].set_ylabel(f"{label} (ID {sid})\n{ylabel_prefix}", fontsize=11, fontweight="bold")
+
+        extent = [coord2[0], coord2[-1], coord1[0], coord1[-1]] if is_polar else [coord1[0], coord1[-1], coord2[0], coord2[-1]]
+        aspect_mode = "auto" if is_polar else "equal"
 
         # True Field
         vmax_field = np.nanmax(yt) * 1.02
         vmin_field = 0.5
-        im0 = axes[row, 0].imshow(yt, origin="lower", extent=[xi[0], xi[-1], eta[0], eta[-1]],
-                                 cmap="inferno", vmin=vmin_field, vmax=vmax_field, aspect="equal")
+        im0 = axes[row, 0].imshow(yt, origin="lower", extent=extent,
+                                  cmap="inferno", vmin=vmin_field, vmax=vmax_field, aspect=aspect_mode)
         axes[row, 0].set_title(f"True Field ($d/W={d_val:.2f}, H/W={hw_val:.2f}$)\nPeak = {np.nanmax(yt):.2f}", fontsize=10)
-        axes[row, 0].set_xlabel(r"$\xi = x/W$")
+        axes[row, 0].set_xlabel(xlabel)
         fig.colorbar(im0, ax=axes[row, 0], fraction=0.04, pad=0.04)
 
         # Predicted Field
-        im1 = axes[row, 1].imshow(yp, origin="lower", extent=[xi[0], xi[-1], eta[0], eta[-1]],
-                                 cmap="inferno", vmin=vmin_field, vmax=vmax_field, aspect="equal")
+        im1 = axes[row, 1].imshow(yp, origin="lower", extent=extent,
+                                  cmap="inferno", vmin=vmin_field, vmax=vmax_field, aspect=aspect_mode)
         axes[row, 1].set_title(f"POD-GP Predicted Field\nPeak = {np.nanmax(yp):.2f}", fontsize=10)
-        axes[row, 1].set_xlabel(r"$\xi = x/W$")
+        axes[row, 1].set_xlabel(xlabel)
         fig.colorbar(im1, ax=axes[row, 1], fraction=0.04, pad=0.04)
 
         # Absolute Error Map
         vmax_err = max(0.05, float(np.nanmax(diff) * 1.05))
-        im2 = axes[row, 2].imshow(diff, origin="lower", extent=[xi[0], xi[-1], eta[0], eta[-1]],
-                                 cmap="viridis", vmin=0.0, vmax=vmax_err, aspect="equal")
+        im2 = axes[row, 2].imshow(diff, origin="lower", extent=extent,
+                                  cmap="viridis", vmin=0.0, vmax=vmax_err, aspect=aspect_mode)
         axes[row, 2].set_title(f"Absolute Error Map\nRel $L_2$ Error = {l2_err:.3f}%", fontsize=10)
-        axes[row, 2].set_xlabel(r"$\xi = x/W$")
+        axes[row, 2].set_xlabel(xlabel)
         cbar2 = fig.colorbar(im2, ax=axes[row, 2], fraction=0.04, pad=0.04)
         cbar2.set_label("|Predicted - True|", fontsize=9)
 
-    fig.suptitle("POD + GP 2D Stress Field Reconstruction: Best vs. Worst Test Samples", fontsize=13, fontweight="bold")
+    title_desc = "Polar Grid (64x64)" if is_polar else "Cartesian Grid (128x64)"
+    fig.suptitle(f"POD + GP 2D Stress Field Reconstruction [{title_desc}]: Best vs. Worst Test Samples", fontsize=13, fontweight="bold")
     os.makedirs(os.path.dirname(out_path) or ".", exist_ok=True)
     fig.savefig(out_path, dpi=150)
     plt.close(fig)
@@ -291,28 +298,39 @@ def plot_best_and_worst_samples(true_fields, pred_fields, masks, d_over_W, H_ove
 def run_pod_pipeline(npz_path="data/fields.npz", seed=42):
     """Executes the complete POD-GP training and evaluation pipeline for both splits."""
     if not os.path.exists(npz_path):
-        raise FileNotFoundError(f"{npz_path} not found. Run data_gen/gen_fields.py first.")
+        raise FileNotFoundError(f"{npz_path} not found.")
 
-    print(f"Loading {npz_path}...")
+    is_polar = "polar" in os.path.basename(npz_path).lower()
+    suffix = "_polar" if is_polar else ""
+
+    print(f"Loading {npz_path} (is_polar={is_polar})...")
     data = np.load(npz_path)
-    fields = data["fields"]       # (N, ny, nx)
-    masks = data["masks"]         # (N, ny, nx)
+    fields = data["fields"]       # (N, ny, nx) or (N, ns, ntheta)
+    masks = data["masks"] if "masks" in data else np.ones_like(fields, dtype=bool)
     d_over_W = data["d_over_W"]   # (N,)
     H_over_W = data["H_over_W"]   # (N,)
     kt_gross = data["kt_gross"]   # (N,)
     ids = data["ids"]             # (N,)
-    xi = data["xi"]               # (nx,)
-    eta = data["eta"]             # (ny,)
+
+    if is_polar:
+        coord1 = data["s"] if "s" in data else np.linspace(0, 1, fields.shape[1])
+        coord2 = data["theta"] if "theta" in data else np.linspace(0, np.pi / 2, fields.shape[2])
+    else:
+        coord1 = data["xi"]
+        coord2 = data["eta"]
+
     N = len(fields)
+    print(f"Loaded {N} fields of resolution {fields.shape[1]}x{fields.shape[2]}.")
 
-    print(f"Loaded {N} fields of resolution {len(eta)}x{len(xi)}.")
-
-    # 1. Fill holes for PCA
-    print("Filling circular hole interiors for PCA decomposition...")
-    t0 = time.perf_counter()
-    filled_fields = fill_hole_pixels(fields, masks)
-    print(f"Holes filled in {time.perf_counter() - t0:.2f} s.")
-    flat_all = filled_fields.reshape(N, -1)
+    # 1. Fill holes for PCA (Cartesian only; Polar grid has no hole)
+    if is_polar:
+        flat_all = fields.reshape(N, -1)
+    else:
+        print("Filling circular hole interiors for PCA decomposition...")
+        t0 = time.perf_counter()
+        filled_fields = fill_hole_pixels(fields, masks)
+        print(f"Holes filled in {time.perf_counter() - t0:.2f} s.")
+        flat_all = filled_fields.reshape(N, -1)
 
     # Inputs: d_over_W, H_over_W only
     X_all = np.column_stack([d_over_W, H_over_W])
@@ -343,18 +361,23 @@ def run_pod_pipeline(npz_path="data/fields.npz", seed=42):
 
     # Predict test fields
     pred_fields_te_A, pred_masks_te_A = predict_fields(
-        gps_A, pca_A, X_all[idx_te], d_over_W[idx_te], xi, eta, n_modes=chosen_modes
+        gps_A, pca_A, X_all[idx_te], d_over_W[idx_te], coord1, coord2, n_modes=chosen_modes, is_polar=is_polar
     )
 
     # Metrics on test set
     metrics_A = compute_field_metrics(pred_fields_te_A, fields[idx_te], masks[idx_te])
     single_us_A, batch_us_A = time_inference(
-        gps_A, pca_A, X_all[idx_te], d_over_W[idx_te], xi, eta, n_modes=chosen_modes
+        gps_A, pca_A, X_all[idx_te], d_over_W[idx_te], coord1, coord2, n_modes=chosen_modes, is_polar=is_polar
     )
+
+    # Uniform field baseline error
+    u_err_A = [np.linalg.norm(1.0 - t[m]) / np.linalg.norm(t[m]) * 100 for t, m in zip(fields[idx_te], masks[idx_te])]
+    mean_u_err_A = float(np.mean(u_err_A))
 
     print("\n--- Interpolation Test Set Results ---")
     print(f"Mean Relative L2 Error: {metrics_A['mean_rel_l2_%']:.3f}%")
     print(f"Max Relative L2 Error:  {metrics_A['max_rel_l2_%']:.3f}%")
+    print(f"Uniform Field (1.0) Err: {mean_u_err_A:.3f}%")
     print(f"Mean Abs Pixel Error:   {metrics_A['mean_abs_pixel_err']:.4f}")
     print(f"Mean Peak Error:        {metrics_A['mean_peak_err_%']:.3f}%")
     print(f"Max Peak Error:         {metrics_A['max_peak_err_%']:.3f}%")
@@ -362,6 +385,7 @@ def run_pod_pipeline(npz_path="data/fields.npz", seed=42):
     print(f"Batched latency:        {batch_us_A:,.1f} us/sample ({batch_us_A / 1000:.4f} ms/sample)")
 
     # Diagnostic best/worst figure on interpolation test set
+    out_fig_path = f"results/pod_best_worst{suffix}.png"
     plot_best_and_worst_samples(
         true_fields=fields[idx_te],
         pred_fields=pred_fields_te_A,
@@ -370,9 +394,10 @@ def run_pod_pipeline(npz_path="data/fields.npz", seed=42):
         H_over_W=H_over_W[idx_te],
         rel_l2_list=metrics_A["per_sample_rel_l2_%"],
         ids=ids[idx_te],
-        xi=xi,
-        eta=eta,
-        out_path="results/pod_best_worst.png"
+        coord1=coord1,
+        coord2=coord2,
+        is_polar=is_polar,
+        out_path=out_fig_path
     )
 
     # =========================================================================
@@ -391,17 +416,22 @@ def run_pod_pipeline(npz_path="data/fields.npz", seed=42):
     gps_B = train_gp_surrogates(X_all[idx_ext_tr], coeffs_tr_B, n_modes=chosen_modes, seed=seed)
 
     pred_fields_te_B, pred_masks_te_B = predict_fields(
-        gps_B, pca_B, X_all[idx_ext_te], d_over_W[idx_ext_te], xi, eta, n_modes=chosen_modes
+        gps_B, pca_B, X_all[idx_ext_te], d_over_W[idx_ext_te], coord1, coord2, n_modes=chosen_modes, is_polar=is_polar
     )
 
     metrics_B = compute_field_metrics(pred_fields_te_B, fields[idx_ext_te], masks[idx_ext_te])
     single_us_B, batch_us_B = time_inference(
-        gps_B, pca_B, X_all[idx_ext_te], d_over_W[idx_ext_te], xi, eta, n_modes=chosen_modes
+        gps_B, pca_B, X_all[idx_ext_te], d_over_W[idx_ext_te], coord1, coord2, n_modes=chosen_modes, is_polar=is_polar
     )
+
+    # Uniform field baseline error
+    u_err_B = [np.linalg.norm(1.0 - t[m]) / np.linalg.norm(t[m]) * 100 for t, m in zip(fields[idx_ext_te], masks[idx_ext_te])]
+    mean_u_err_B = float(np.mean(u_err_B))
 
     print("\n--- Extrapolation Test Set Results ---")
     print(f"Mean Relative L2 Error: {metrics_B['mean_rel_l2_%']:.3f}%")
     print(f"Max Relative L2 Error:  {metrics_B['max_rel_l2_%']:.3f}%")
+    print(f"Uniform Field (1.0) Err: {mean_u_err_B:.3f}%")
     print(f"Mean Abs Pixel Error:   {metrics_B['mean_abs_pixel_err']:.4f}")
     print(f"Mean Peak Error:        {metrics_B['mean_peak_err_%']:.3f}%")
     print(f"Max Peak Error:         {metrics_B['max_peak_err_%']:.3f}%")
@@ -412,7 +442,7 @@ def run_pod_pipeline(npz_path="data/fields.npz", seed=42):
     # SAVE PREDICTIONS AND METRICS
     # =========================================================================
     # 1. Predictions .npz
-    out_preds_path = "results/pod_predictions.npz"
+    out_preds_path = f"results/pod_predictions{suffix}.npz"
     os.makedirs(os.path.dirname(out_preds_path) or ".", exist_ok=True)
     np.savez_compressed(
         out_preds_path,
@@ -430,19 +460,21 @@ def run_pod_pipeline(npz_path="data/fields.npz", seed=42):
         extrap_d_over_W=d_over_W[idx_ext_te],
         extrap_H_over_W=H_over_W[idx_ext_te],
         extrap_kt_gross=kt_gross[idx_ext_te],
-        xi=xi,
-        eta=eta
+        coord1=coord1,
+        coord2=coord2,
+        is_polar=is_polar
     )
     print(f"\nSaved predictions archive to {out_preds_path} ({os.path.getsize(out_preds_path)/(1024*1024):.2f} MB).")
 
     # 2. Results CSV
-    out_csv_path = "results/pod_results.csv"
+    out_csv_path = f"results/pod_results{suffix}.csv"
     res_df = pd.DataFrame([
         {
             "split": "interp",
             "n_modes": chosen_modes,
             "mean_rel_l2_%": metrics_A["mean_rel_l2_%"],
             "max_rel_l2_%": metrics_A["max_rel_l2_%"],
+            "uniform_rel_l2_%": mean_u_err_A,
             "mean_abs_pixel_err": metrics_A["mean_abs_pixel_err"],
             "mean_peak_err_%": metrics_A["mean_peak_err_%"],
             "max_peak_err_%": metrics_A["max_peak_err_%"],
@@ -454,6 +486,7 @@ def run_pod_pipeline(npz_path="data/fields.npz", seed=42):
             "n_modes": chosen_modes,
             "mean_rel_l2_%": metrics_B["mean_rel_l2_%"],
             "max_rel_l2_%": metrics_B["max_rel_l2_%"],
+            "uniform_rel_l2_%": mean_u_err_B,
             "mean_abs_pixel_err": metrics_B["mean_abs_pixel_err"],
             "mean_peak_err_%": metrics_B["mean_peak_err_%"],
             "max_peak_err_%": metrics_B["max_peak_err_%"],
@@ -469,8 +502,10 @@ def run_pod_pipeline(npz_path="data/fields.npz", seed=42):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="POD + GP 2D stress field surrogate.")
-    parser.add_argument("--npz", default="data/fields.npz", help="Path to fields.npz")
+    parser.add_argument("--data", default="data/fields.npz", help="Path to fields .npz (Cartesian or Polar)")
+    parser.add_argument("--npz", default=None, help="Alias for --data")
     parser.add_argument("--seed", type=int, default=42, help="Random seed")
     args = parser.parse_args()
 
-    run_pod_pipeline(npz_path=args.npz, seed=args.seed)
+    npz_file = args.npz if args.npz is not None else args.data
+    run_pod_pipeline(npz_path=npz_file, seed=args.seed)
