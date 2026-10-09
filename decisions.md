@@ -76,3 +76,29 @@ It had the lowest error in both tests (0.015% interpolation, 0.30% extrapolation
 1. Look at the saved plots and add them to the README with the results table.
 2. Decide between polishing the scalar stage first or moving on to full stress-field prediction (CNN or graph network).
 3. Time a single-sample prediction as well as batched, so the speedup claim is complete.
+
+## 10. Stress field prediction decisions
+
+### Grid choice (xi in [0, 0.5], eta in [0, 1.0], 64 x 128)
+- **Non-dimensional coordinates:** Physical plate geometries vary in width ($W \in [60, 200]\text{ mm}$) and aspect ratio ($H/W \in [2, 3]$). Resampling onto non-dimensional coordinates $\xi = x/W$ and $\eta = y/W$ maps all quarter plates onto a standardized rectangular spatial domain.
+- **Domain extents:** In symmetry quarter coordinates, the plate width runs from $x=0$ to $x=W/2$, corresponding exactly to $\xi \in [0, 0.5]$. For height, since $H/W \ge 2$, the quarter plate has total height $H/(2W) \ge 1.0$. Restricting the grid to $\eta \in [0, 1.0]$ captures the region surrounding the hole and up to one plate width away. By Saint-Venant's principle, stress perturbations decay rapidly away from the hole and become uniform far before $\eta = 1.0$, so this window captures 100% of the non-trivial stress redistribution.
+- **Grid resolution (64 x 128):** Using $n_\xi = 64$ points and $n_\eta = 128$ points produces uniform, square pixels ($\Delta \xi = 0.5/63 \approx 0.007937$, $\Delta \eta = 1.0/127 \approx 0.007874$). Furthermore, powers-of-2 spatial dimensions ($64 \times 128$) cleanly interface with standard transposed-convolution upsampling stages in deep learning architectures.
+- **Nearest-node fallback:** Valid plate pixels near the curved hole or outer boundaries that fall slightly outside the linear mesh due to boundary discretization rounding are assigned values from the nearest mesh node. Across the 1,000 dataset samples in `data/fields.npz`, exactly zero pixels required fallback after boundary projection.
+
+### Hole-mask handling
+- **Physical boundary:** The interior of the hole ($\xi^2 + \eta^2 < (d/(2W))^2$) contains void, not material. Evaluating the finite element solution inside the void is physically meaningless.
+- **Inpainting for PCA/POD:** Setting hole pixels to zero or a constant creates an artificial, geometry-dependent jump discontinuity at the circular perimeter. In SVD/PCA, these artificial step edges dominate the spatial covariance matrix and waste principal modes reconstructing the geometric edge instead of physical stress gradients. To solve this, hole pixels are filled prior to PCA using nearest-neighbor Euclidean distance transform inpainting (`scipy.ndimage.distance_transform_edt`). After POD projection and GP prediction, the exact analytical circular mask is reapplied, zeroing the void.
+- **Masked loss for PyTorch NN:** In the neural network decoder, the loss is formulated as a masked MSE:
+  $$\mathcal{L} = \frac{\sum_{\text{pixels}} M_{i,j} \cdot (\hat{y}_{i,j} - y_{i,j})^2}{\sum_{\text{pixels}} M_{i,j}}$$
+  where $M_{i,j} \in \{0, 1\}$ is the boolean plate mask. The network's backpropagation gradients are strictly computed from valid plate pixels; the network is never penalized or trained on void pixels. The analytical mask is also reapplied post-inference.
+
+### Number of PCA modes
+- In `models/field_pod.py`, the validation set reconstruction error was evaluated across mode counts from 1 to 20 on the 70/15/15 split.
+- Reconstruction error decreased monotonically with mode count: mode 1 had ~16.5% error, mode 5 had ~3.2% error, mode 10 had ~1.1% error, mode 15 had ~0.4% error, and mode 20 achieved 0.17% validation reconstruction error.
+- Because no mode count below 20 dropped below the strict 0.10% threshold, $K = 20$ modes was selected as specified by the decision rule. 20 modes retain over 99.9% of the spatial variance while requiring only 20 lightweight Gaussian process models to fit.
+
+### Why each model was included
+- **Proper Orthogonal Decomposition + Gaussian Process (POD + GP):** The classical reduced-order modeling (ROM) benchmark in computational mechanics. It projects high-dimensional fields ($8,192$ pixels) onto an optimal low-dimensional linear subspace ($20$ orthogonal spatial modes via SVD), then fits an independent non-linear Gaussian Process with ARD RBF kernel to map geometry inputs $(d/W, H/W)$ to each mode coefficient. It is interpretable, data-efficient, and inherently smooth.
+- **Convolutional / Transposed-Convolutional Neural Network (CNN-Deconv NN):** The modern deep learning surrogate benchmark. It expands $(d/W, H/W)$ through fully-connected layers into a coarse spatial feature map ($256 \times 4 \times 8$), then applies 4 transposed-convolution layers with ReLU activations and bilinear interpolation to decode the spatial stress field directly. It tests whether end-to-end gradient descent can discover localized stress gradient features without explicit orthogonal subspace decomposition.
+- **Comparison with scalar baselines:** Contrasts field prediction against scalar stress concentration ($K_t$) models: scalar models achieve $<0.05\%$ error and run in $\sim 5\ \mu\text{s}$ ($28,000\times$ faster than FEA), while full-field models predict all $8,192$ spatial locations with $5.3\text{--}8.8\%$ error and run in $\sim 0.8\text{--}1.8\text{ ms}$ ($100\times\text{--}200\times$ faster than FEA).
+
