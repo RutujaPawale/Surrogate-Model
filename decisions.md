@@ -102,3 +102,36 @@ It had the lowest error in both tests (0.015% interpolation, 0.30% extrapolation
 - **Convolutional / Transposed-Convolutional Neural Network (CNN-Deconv NN):** The modern deep learning surrogate benchmark. It expands $(d/W, H/W)$ through fully-connected layers into a coarse spatial feature map ($256 \times 4 \times 8$), then applies 4 transposed-convolution layers with ReLU activations and bilinear interpolation to decode the spatial stress field directly. It tests whether end-to-end gradient descent can discover localized stress gradient features without explicit orthogonal subspace decomposition.
 - **Comparison with scalar baselines:** Contrasts field prediction against scalar stress concentration ($K_t$) models: scalar models achieve $<0.05\%$ error and run in $\sim 5\ \mu\text{s}$ ($28,000\times$ faster than FEA), while full-field models predict all $8,192$ spatial locations with $5.3\text{--}8.8\%$ error and run in $\sim 0.8\text{--}1.8\text{ ms}$ ($100\times\text{--}200\times$ faster than FEA).
 
+
+## 11. Field diagnostics, polar coordinates, and surrogate comparison decisions
+
+### Why the diagnostics were added
+Standard full-field relative $L_2$ error across an entire plate can easily mask localized physical failures:
+- **Trivial baselines (Uniform 1.0 and Mean Training Field):** A predictor outputting a constant flat field of 1.0 achieves ~20.1% relative $L_2$ error on the Cartesian grid and ~33.8% on the polar grid simply because the plate's far-field nominal stress is 1.0. Similarly, the pixelwise mean training field achieves ~14.5% (Cartesian) and ~15.8% (polar). Benchmarking surrogates against these trivial predictors proved whether a machine learning model was genuinely capturing stress concentration mechanics or merely reproducing the uniform background plate.
+- **Perturbation relative $L_2$ error:** The physical quantity of interest is the stress concentration above nominal tension: $(\sigma_{\text{vm}} - 1)$. Measuring relative error on the perturbation $(\hat{y} - 1)$ vs. $(y - 1)$ isolates model fidelity in the stress concentration gradient without dilution from the uniform background. This metric immediately revealed that Cartesian models had 41.1% to 59.2% mean perturbation error (with worst cases >200%), whereas polar POD+GP achieved 0.92% mean perturbation error.
+- **Near-hole error:** The circular annular zone within $2 \times (d/2) = d$ of the hole center carries the steep stress gradient. Computing $L_2$ error specifically in this near-hole subregion confirmed that Cartesian errors were concentrated right at the notch boundary (15.5% for POD and 19.6% for NN) rather than in the far field.
+- **Worst-sample lists:** Ranking test geometries by perturbation error revealed systematic failure modes. On the Cartesian grid, the 10 worst samples were all small holes ($d/W = 0.057\text{--}0.097$) because a small circular notch is severely blurred on a fixed pixel grid. On the extrapolation split, the worst samples were at $d/W \to 0.50$ where net section ligament necking is most extreme.
+
+### Why the polar grid was chosen
+- **Moving boundary pathology in Cartesian grids:** In Cartesian coordinates $(x/W, y/W)$, the hole boundary moves as $d/W$ changes. For small holes ($d/W \approx 0.057$), the hole radius is just ~3.6 pixels. The steep stress drop from 3.0 to 1.0 is compressed into 2–3 pixels. Furthermore, inpainting void pixels with Euclidean distance transform creates non-physical edges that distort PCA eigenvectors and convolutional receptive fields.
+- **Body-fitted coordinate transformation:** Defining $\rho(s) = r + s(W/2 - r)$ with $s \in [0, 1]$ (64 points) and $\theta \in [0, \pi/2]$ (64 points) transforms the solid plate ligament into a regular square computational domain $[0, 1] \times [0, \pi/2]$:
+  1. The notch boundary is locked at $s = 0$ for all geometries.
+  2. The notch root ($x=r, y=0$), where stress concentration peaks, is permanently anchored at coordinate $(s=0, \theta=0)$.
+  3. Every grid point represents solid material; no hole mask or inpainting is required.
+  4. Radial resolution is automatically concentrated where the ligament is narrowest and gradients are steepest.
+- **Domain coverage note:** The polar grid covers the region within $\rho \le W/2$ around the hole, whereas the Cartesian grid extended to $\eta = 1.0$. The two grids measure errors over different physical domains and are not directly comparable numerically.
+
+### Why only 6 PCA modes were needed
+- On the Cartesian grid, 20 modes were required just to reach 0.17% validation reconstruction error because spatial modes were wasted reconstructing moving circular boundary edges and inpainting artifacts.
+- On the body-fitted polar grid, all fields are continuous, smooth, and aligned: the peak is always at $(0, 0)$ and the decay is along $s$.
+- Evaluating PCA reconstruction error on the polar training set:
+  - 1 mode: 5.67% validation error
+  - 2 modes: 1.18% validation error
+  - 4 modes: 0.22% validation error
+  - 6 modes: **0.068%** validation reconstruction error (well below the 0.10% threshold).
+- Just 6 orthogonal spatial modes explain 99.98% of the total spatial variance across all 1,000 simulations.
+
+### Why POD+GP outperformed the neural network
+1. **Mathematical alignment with physics:** The polar stress field is governed by linear elasticity, which produces smooth, monotonic decay from the notch root. POD discovers the optimal spatial basis functions via singular value decomposition (SVD). Because the governing mechanics are smooth functions of the two scalar inputs $(d/W, H/W)$, Gaussian Processes with ARD RBF kernels fit the 6 mode amplitudes almost perfectly ($R^2 > 0.9999$).
+2. **Data efficiency:** We have 700 training samples. A neural network decoder has 1.77 million trainable weights and must learn spatial convolutions and upsampling filters from scratch via stochastic gradient descent (Adam). In contrast, POD extracts the exact spatial basis analytically from the data covariance in seconds, leaving the GPs with only a 2D-to-1D regression task per mode.
+3. **Smoothness vs. convolutional artifacts:** Transposed convolutions in neural network decoders frequently produce subtle checkerboard artifacts or spatial blur. Gaussian processes produce mathematically smooth interpolants without grid artifacts, achieving $0.281\%$ mean relative $L_2$ error and $0.068\%$ peak stress error compared to the NN's $0.613\%$ and $0.546\%$.
