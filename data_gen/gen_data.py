@@ -113,7 +113,7 @@ def make_mesh(W, H, r, n_hole=12, far_div=10):
 
 
 # ---- solver ------------------------------------------------------------------
-def solve_plate(W, H, r, sigma, n_hole=12):
+def solve_plate(W, H, r, sigma, n_hole=12, return_field=False):
     """Run one FEA. Returns dict with peak von Mises stress and timings."""
     t0 = time.perf_counter()
     mesh = make_mesh(W, H, r, n_hole=n_hole)
@@ -159,13 +159,20 @@ def solve_plate(W, H, r, sigma, n_hole=12):
     vm_nodal = p1.project(vm)
     t_solve = time.perf_counter() - t1
 
-    return {
+    res = {
         "peak_vm": float(vm_nodal.max()),
         "n_nodes": int(mesh.p.shape[1]),
         "n_elems": int(mesh.t.shape[1]),
         "t_mesh": t_mesh,
         "t_solve": t_solve,
     }
+    if return_field:
+        res["mesh"] = mesh
+        res["W"] = W
+        res["r"] = r
+        res["sigma"] = sigma
+        res["vm_nodal"] = vm_nodal
+    return res
 
 
 # ---- theory (for validation) -------------------------------------------------
