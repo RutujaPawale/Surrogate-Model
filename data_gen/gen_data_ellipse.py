@@ -694,6 +694,8 @@ def generate(n=1500, out="data/plate_ellipse.csv", n_hole=64, seed=42, tip_refin
         print(f"Mesh checks (n=128):  {len(valid_checks)} runs (5% subset)")
         print(f"mesh_check_pct mean:  {valid_checks.mean():.4f}%")
         print(f"mesh_check_pct max:   {valid_checks.max():.4f}%")
+        print(f"mesh_check_pct (abs) mean: {valid_checks.abs().mean():.4f}%")
+        print(f"mesh_check_pct (abs) max:  {valid_checks.abs().max():.4f}%")
     print("=" * 80 + "\n")
 
     return df
